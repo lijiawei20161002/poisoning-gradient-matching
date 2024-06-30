@@ -25,8 +25,11 @@ class _Witch():
 
     """
 
-    def __init__(self, args, setup=dict(device=torch.device('cpu'), dtype=torch.float)):
+    def __init__(self, args, setup=None):
         """Initialize a model with given specs..."""
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if setup is None:
+            setup = dict(device=self.device, dtype=torch.float)
         self.args, self.setup = args, setup
         self.retain = True if self.args.ensemble > 1 and self.args.local_rank is None else False
         self.stat_optimal_loss = None
@@ -41,16 +44,16 @@ class _Witch():
                     if self.args.budget > 0:
                         poison_delta = self._brew(victim, kettle)
                     else:
-                        poison_delta = kettle.initialize_poison(initializer='zero')
+                        poison_delta = kettle.initialize_poison(initializer='zero').to(self.device)
                         warnings.warn('No poison budget given. Nothing can be poisoned.')
                 else:
-                    poison_delta = kettle.initialize_poison(initializer='zero')
+                    poison_delta = kettle.initialize_poison(initializer='zero').to(self.device)
                     warnings.warn('Perturbation interval is empty. Nothing can be poisoned.')
             else:
-                poison_delta = kettle.initialize_poison(initializer='zero')
+                poison_delta = kettle.initialize_poison(initializer='zero').to(self.device)
                 warnings.warn('Target set is empty. Nothing can be poisoned.')
         else:
-            poison_delta = kettle.initialize_poison(initializer='zero')
+            poison_delta = kettle.initialize_poison(initializer='zero').to(self.device)
             warnings.warn('Poison set is empty. Nothing can be poisoned.')
 
         return poison_delta
@@ -59,7 +62,7 @@ class _Witch():
         """Run generalized iterative routine."""
         print(f'Starting brewing procedure ...')
         self._initialize_brew(victim, kettle)
-        poisons, scores = [], torch.ones(self.args.restarts) * 10_000
+        poisons, scores = [], torch.ones(self.args.restarts, device=self.device) * 10_000
 
         for trial in range(self.args.restarts):
             poison_delta, target_losses = self._run_trial(victim, kettle)
@@ -80,9 +83,9 @@ class _Witch():
         """Implement common initialization operations for brewing."""
         victim.eval(dropout=True)
         # Compute target gradients
-        self.targets = torch.stack([data[0] for data in kettle.targetset], dim=0).to(**self.setup)
-        self.intended_classes = torch.tensor(kettle.poison_setup['intended_class']).to(device=self.setup['device'], dtype=torch.long)
-        self.true_classes = torch.tensor([data[1] for data in kettle.targetset]).to(device=self.setup['device'], dtype=torch.long)
+        self.targets = torch.stack([data[0] for data in kettle.targetset], dim=0).to(self.device)
+        self.intended_classes = torch.tensor(kettle.poison_setup['intended_class']).to(device=self.device, dtype=torch.long)
+        self.true_classes = torch.tensor([data[1] for data in kettle.targetset]).to(device=self.device, dtype=torch.long)
 
 
         # Precompute target gradients
@@ -118,18 +121,16 @@ class _Witch():
             # Rule 2
             self.tau0 = self.args.tau * (self.args.pbatch / 512) / self.args.ensemble
 
-
-
     def _run_trial(self, victim, kettle):
         """Run a single trial."""
-        poison_delta = kettle.initialize_poison()
+        poison_delta = kettle.initialize_poison().to(self.device)
         if self.args.full_data:
             dataloader = kettle.trainloader
         else:
             dataloader = kettle.poisonloader
 
         if self.args.attackoptim in ['Adam', 'signAdam', 'momSGD', 'momPGD']:
-            # poison_delta.requires_grad_()
+            poison_delta.requires_grad_()
             if self.args.attackoptim in ['Adam', 'signAdam']:
                 att_optimizer = torch.optim.Adam([poison_delta], lr=self.tau0, weight_decay=0)
             else:
@@ -137,9 +138,8 @@ class _Witch():
             if self.args.scheduling:
                 scheduler = torch.optim.lr_scheduler.MultiStepLR(att_optimizer, milestones=[self.args.attackiter // 2.667, self.args.attackiter // 1.6,
                                                                                             self.args.attackiter // 1.142], gamma=0.1)
-            poison_delta.grad = torch.zeros_like(poison_delta)
-            dm, ds = kettle.dm.to(device=torch.device('cpu')), kettle.ds.to(device=torch.device('cpu'))
-            poison_bounds = torch.zeros_like(poison_delta)
+            dm, ds = kettle.dm.to(device=self.device), kettle.ds.to(device=self.device)
+            poison_bounds = torch.zeros_like(poison_delta).to(self.device)
         else:
             poison_bounds = None
 
@@ -148,23 +148,26 @@ class _Witch():
             poison_correct = 0
             for batch, example in enumerate(dataloader):
                 loss, prediction = self._batched_step(poison_delta, poison_bounds, example, victim, kettle)
-                target_losses += loss
+                target_losses += loss.item()
                 poison_correct += prediction
+
+                # Backward pass to calculate gradients
+                if loss.requires_grad:
+                    loss.backward()
 
                 if self.args.dryrun:
                     break
 
-            # Note that these steps are handled batch-wise for PGD in _batched_step
-            # For the momentum optimizers, we only accumulate gradients for all poisons
-            # and then use optimizer.step() for the update. This is math. equivalent
-            # and makes it easier to let pytorch track momentum.
             if self.args.attackoptim in ['Adam', 'signAdam', 'momSGD', 'momPGD']:
                 if self.args.attackoptim in ['momPGD', 'signAdam']:
                     poison_delta.grad.sign_()
+
                 att_optimizer.step()
                 if self.args.scheduling:
                     scheduler.step()
+
                 att_optimizer.zero_grad()
+
                 with torch.no_grad():
                     # Projection Step
                     poison_delta.data = torch.max(torch.min(poison_delta, self.args.eps /
@@ -176,7 +179,7 @@ class _Witch():
             poison_acc = poison_correct / len(dataloader.dataset)
             if step % (self.args.attackiter // 5) == 0 or step == (self.args.attackiter - 1):
                 print(f'Iteration {step}: Target loss is {target_losses:2.4f}, '
-                      f'Poison clean acc is {poison_acc * 100:2.2f}%')
+                    f'Poison clean acc is {poison_acc * 100:2.2f}%')
 
             if self.args.step:
                 if self.args.clean_grad:
@@ -187,16 +190,14 @@ class _Witch():
             if self.args.dryrun:
                 break
 
-        return poison_delta, target_losses
-
-
+        return poison_delta, target_losses 
 
     def _batched_step(self, poison_delta, poison_bounds, example, victim, kettle):
-        """Take a step toward minmizing the current target loss."""
+        """Take a step toward minimizing the current target loss."""
         inputs, labels, ids = example
 
-        inputs = inputs.to(**self.setup)
-        labels = labels.to(dtype=torch.long, device=self.setup['device'], non_blocking=NON_BLOCKING)
+        inputs = inputs.to(self.device)
+        labels = labels.to(dtype=torch.long, device=self.device, non_blocking=NON_BLOCKING)
         # Add adversarial pattern
         poison_slices, batch_positions = [], []
         for batch_id, image_id in enumerate(ids.tolist()):
@@ -211,10 +212,11 @@ class _Witch():
             inputs, labels, poison_slices, batch_positions)
 
         if len(batch_positions) > 0:
-            delta_slice = poison_delta[poison_slices].detach().to(**self.setup)
+            delta_slice = poison_delta[poison_slices].to(self.device)
             if self.args.clean_grad:
                 delta_slice = torch.zeros_like(delta_slice)
             delta_slice.requires_grad_()
+            delta_slice.retain_grad()  # Retain gradients for non-leaf tensor
             poison_images = inputs[batch_positions]
             inputs[batch_positions] += delta_slice
 
@@ -224,29 +226,30 @@ class _Witch():
 
             # Define the loss objective and compute gradients
             closure = self._define_objective(inputs, labels, self.targets, self.intended_classes,
-                                             self.true_classes)
+                                            self.true_classes)
             loss, prediction = victim.compute(closure, self.target_grad, self.target_clean_grad,
-                                              self.target_gnorm)
+                                            self.target_gnorm)
             delta_slice = victim.sync_gradients(delta_slice)
 
             if self.args.clean_grad:
-                delta_slice.data = poison_delta[poison_slices].detach().to(**self.setup)
+                delta_slice.data = poison_delta[poison_slices].to(self.device)
 
             # Update Step
             if self.args.attackoptim in ['PGD', 'GD']:
                 delta_slice = self._pgd_step(delta_slice, poison_images, self.tau0, kettle.dm, kettle.ds)
 
                 # Return slice to CPU:
-                poison_delta[poison_slices] = delta_slice.detach().to(device=torch.device('cpu'))
+                poison_delta[poison_slices] = delta_slice.detach().to(self.device)
             elif self.args.attackoptim in ['Adam', 'signAdam', 'momSGD', 'momPGD']:
-                poison_delta.grad[poison_slices] = delta_slice.grad.detach().to(device=torch.device('cpu'))
-                poison_bounds[poison_slices] = poison_images.detach().to(device=torch.device('cpu'))
+                poison_delta.grad[poison_slices] = delta_slice.grad.detach().to(device=self.device)
+                poison_bounds[poison_slices] = poison_images.detach().to(device=self.device)
             else:
                 raise NotImplementedError('Unknown attack optimizer.')
         else:
-            loss, prediction = torch.tensor(0), torch.tensor(0)
+            loss = torch.tensor(0., device=self.device, requires_grad=True)
+            prediction = torch.tensor(0., device=self.device)
 
-        return loss.item(), prediction.item()
+        return loss, prediction
 
     def _define_objective():
         """Implement the closure here."""
